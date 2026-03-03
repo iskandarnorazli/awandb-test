@@ -15,7 +15,6 @@ TABLE_DIM = "telemetry_dim"
 
 # The test matrix: Scaling through L1/L2, L3, and Main RAM boundaries
 DATA_SIZES = [10_000, 100_000, 1_000_000, 10_000_000, 31_250_000]
-ITERATIONS = 50
 BATCH_SIZE = 1_000_000 # Max rows per Arrow Flight batch to prevent Client OOM
 
 # Expanded Schema for Multi-Col, GroupBy, and Join testing
@@ -59,7 +58,7 @@ def execute_sync(cursor, query, ignore_errors=False):
 
 def measure_latency(cursor, query, iters):
     # Warmup
-    for _ in range(3):
+    for _ in range(2):
         execute_sync(cursor, query, ignore_errors=True)
 
     latencies = []
@@ -85,19 +84,31 @@ def run_matrix():
     # Expanded Metric Tracking
     metrics = {
         "Arrow DoPut Ingestion": [],
-        "Point Lookup (O(1) PK)": [],
-        "Range Scan (1D Predicate)": [],
-        "Range Scan (Multi-Col AND)": [],
-        "Aggregation (Full Scan)": [],
-        "Group By (Hash Map Build)": [],
-        "Hash Join (Fact x Dim)": []
+        "Clean Point Lookup (O(1) PK)": [],
+        "Clean Range Scan (1D Predicate)": [],
+        "Clean Range Scan (Multi-Col AND)": [],
+        "Clean Aggregation (Full Scan)": [],
+        "Clean Group By (Hash Map Build)": [],
+        "Clean Hash Join (Fact x Dim)": [],
+        "Dirty Point Lookup (O(1) PK)": [],
+        "Dirty Range Scan (1D Predicate)": [],
+        "Dirty Aggregation (Full Scan)": [],
+        "Dirty Hash Join (Fact x Dim)": []
     }
 
     client = flight.FlightClient(DB_URI)
     options = flight.FlightCallOptions(headers=[(b"authorization", BASIC_AUTH_HEADER.encode("utf-8"))])
 
     for size in DATA_SIZES:
-        print(f"-> [Seeding & Ingestion Test] Measuring {size:,} rows...")
+        # Dynamic Iteration Scaling to save time on massive datasets
+        if size >= 31_250_000:
+            iters = 5
+        elif size >= 10_000_000:
+            iters = 10
+        else:
+            iters = 50
+
+        print(f"-> [Seeding & Ingestion Test] Measuring {size:,} rows (Iters: {iters})...")
         
         # --- 0. Seed Dimension Table for Joins ---
         execute_sync(cursor, f"DROP TABLE {TABLE_DIM}", ignore_errors=True)
@@ -109,8 +120,6 @@ def run_matrix():
 
         # --- 1. Measure Raw DoPut Ingestion Latency (Fact Table) ---
         ingest_latencies = []
-        
-        # Determine how many iterations for ingestion based on size to save time
         ingest_iters = 5 if size <= 1_000_000 else 2
         
         for _ in range(ingest_iters):
@@ -121,8 +130,6 @@ def run_matrix():
             writer, _ = client.do_put(descriptor, fact_schema, options=options)
             
             start = time.perf_counter()
-            
-            # Chunked Ingestion to prevent Python/JVM GC thrashing
             chunks = max(1, size // BATCH_SIZE)
             remainder = size % BATCH_SIZE
             
@@ -135,7 +142,7 @@ def run_matrix():
             elif chunks == 0:
                 writer.write_batch(generate_fact_batch(size, 0))
                 
-            writer.close()  # Wait for Server ACK
+            writer.close() 
             ingest_latencies.append((time.perf_counter() - start) * 1000)
             
         metrics["Arrow DoPut Ingestion"].append({
@@ -144,33 +151,54 @@ def run_matrix():
             'p99': np.percentile(ingest_latencies, 99)
         })
 
-        # --- 2. Run Query Matrix on the active seeded table ---
-        print(f"   Running topology matrix for {size:,} rows...")
+        # --- 2. CLEAN STATE: Run Query Matrix ---
+        print(f"   Running Clean topology matrix for {size:,} rows...")
         
-        # A. Point Lookup (Should be O(1) Constant Time via ConcurrentHashMap)
         target_id = np.random.randint(0, size)
-        l_point = measure_latency(cursor, f"SELECT * FROM {TABLE_MATRIX} WHERE id = {target_id}", ITERATIONS)
-        metrics["Point Lookup (O(1) PK)"].append(l_point)
+        metrics["Clean Point Lookup (O(1) PK)"].append(
+            measure_latency(cursor, f"SELECT * FROM {TABLE_MATRIX} WHERE id = {target_id}", iters))
 
-        # B. Single Column Range Scan (SIMD Filter)
-        l_range = measure_latency(cursor, f"SELECT COUNT(*) FROM {TABLE_MATRIX} WHERE val1 > 500", ITERATIONS)
-        metrics["Range Scan (1D Predicate)"].append(l_range)
+        metrics["Clean Range Scan (1D Predicate)"].append(
+            measure_latency(cursor, f"SELECT COUNT(*) FROM {TABLE_MATRIX} WHERE val1 > 500", iters))
 
-        # C. Multi-Column Range Scan (Intersection Logic in AST)
-        l_multi = measure_latency(cursor, f"SELECT COUNT(*) FROM {TABLE_MATRIX} WHERE val1 > 500 AND val2 < 500", ITERATIONS)
-        metrics["Range Scan (Multi-Col AND)"].append(l_multi)
+        metrics["Clean Range Scan (Multi-Col AND)"].append(
+            measure_latency(cursor, f"SELECT COUNT(*) FROM {TABLE_MATRIX} WHERE val1 > 500 AND val2 < 500", iters))
 
-        # D. Pure Aggregation (Full Table Scan + Math)
-        l_agg = measure_latency(cursor, f"SELECT SUM(val1) FROM {TABLE_MATRIX}", ITERATIONS)
-        metrics["Aggregation (Full Scan)"].append(l_agg)
+        metrics["Clean Aggregation (Full Scan)"].append(
+            measure_latency(cursor, f"SELECT SUM(val1) FROM {TABLE_MATRIX}", iters))
 
-        # E. Group By (Hash Map Build + Aggregation)
-        l_group = measure_latency(cursor, f"SELECT group_id, SUM(val1) FROM {TABLE_MATRIX} GROUP BY group_id", ITERATIONS)
-        metrics["Group By (Hash Map Build)"].append(l_group)
+        metrics["Clean Group By (Hash Map Build)"].append(
+            measure_latency(cursor, f"SELECT group_id, SUM(val1) FROM {TABLE_MATRIX} GROUP BY group_id", iters))
 
-        # F. Complex JOIN (Native Hash Join Probe & Build)
-        l_join = measure_latency(cursor, f"SELECT * FROM {TABLE_MATRIX} JOIN {TABLE_DIM} ON {TABLE_MATRIX}.group_id = {TABLE_DIM}.group_id", ITERATIONS)
-        metrics["Hash Join (Fact x Dim)"].append(l_join)
+        metrics["Clean Hash Join (Fact x Dim)"].append(
+            measure_latency(cursor, f"SELECT * FROM {TABLE_MATRIX} JOIN {TABLE_DIM} ON {TABLE_MATRIX}.group_id = {TABLE_DIM}.group_id", iters))
+
+        # --- 3. INJECT DIRTY STATE (Tombstones & RAM Deltas) ---
+        print("   -> Injecting Tombstones and Delta Updates (Dirtying Table)...")
+        # Delete first 10% of rows (Creates Disk Tombstones)
+        del_limit = size // 10
+        execute_sync(cursor, f"DELETE FROM {TABLE_MATRIX} WHERE id < {del_limit}")
+        
+        # Update last 10% of rows (Moves Disk records to RAM Delta Buffer)
+        upd_limit = size - (size // 10)
+        execute_sync(cursor, f"UPDATE {TABLE_MATRIX} SET val1 = 8888 WHERE id > {upd_limit}")
+
+        # --- 4. DIRTY STATE: Run Query Matrix ---
+        print(f"   Running Dirty topology matrix for {size:,} rows...")
+        
+        dirty_target_id = np.random.randint(0, size) # Random ID, might be deleted, might be updated
+        metrics["Dirty Point Lookup (O(1) PK)"].append(
+            measure_latency(cursor, f"SELECT * FROM {TABLE_MATRIX} WHERE id = {dirty_target_id}", iters))
+
+        metrics["Dirty Range Scan (1D Predicate)"].append(
+            measure_latency(cursor, f"SELECT COUNT(*) FROM {TABLE_MATRIX} WHERE val1 > 500", iters))
+
+        metrics["Dirty Aggregation (Full Scan)"].append(
+            measure_latency(cursor, f"SELECT SUM(val1) FROM {TABLE_MATRIX}", iters))
+
+        metrics["Dirty Hash Join (Fact x Dim)"].append(
+            measure_latency(cursor, f"SELECT * FROM {TABLE_MATRIX} JOIN {TABLE_DIM} ON {TABLE_MATRIX}.group_id = {TABLE_DIM}.group_id", iters))
+
 
     conn.close()
 
@@ -183,22 +211,17 @@ def run_matrix():
     print(" Equation Format: Total_Time = (Cost_Per_Row * N) + Base_Overhead\n")
 
     x_rows = np.array(DATA_SIZES)
-    
-    # Helper to format sizes for headers (e.g., 10K, 100K, 1M, 10M, 31M)
     size_labels = [f"{s//1000}K" if s < 1_000_000 else f"{s/1_000_000:g}M" for s in DATA_SIZES]
 
     for q_type, y_latencies in metrics.items():
-        # Extract the specific percentiles across all data sizes
         p50s = np.array([m['p50'] for m in y_latencies])
         p90s = np.array([m['p90'] for m in y_latencies])
         p99s = np.array([m['p99'] for m in y_latencies])
         
-        # Calculate slope (m) and intercept (c) for the p50 median -> y = mx + c
         slope, intercept = np.polyfit(x_rows, p50s, 1)
         
-        # Convert to human readable units
-        ns_per_row = slope * 1_000_000  # Convert ms to nanoseconds for micro-cost
-        base_ms = intercept             # Network + JVM JNI setup time
+        ns_per_row = slope * 1_000_000  
+        base_ms = intercept             
         
         print(f" 🔹 {q_type.upper()}")
         print(f"    p50 Latencies : " + " -> ".join([f"{p:>7.2f}ms ({l})" for p, l in zip(p50s, size_labels)]))
