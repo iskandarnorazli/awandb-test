@@ -30,11 +30,18 @@ dim_schema = pa.schema([
     ('multiplier', pa.int32())
 ])
 
-def generate_fact_batch(size, start_id=0):
+def generate_fact_batch(size, start_id=0, deterministic=False):
     ids = np.arange(start_id, start_id + size, dtype=np.int32)
-    groups = np.random.randint(1, 100, size, dtype=np.int32) # 100 Distinct Groups
-    val1 = np.random.randint(0, 1000, size, dtype=np.int32)
-    val2 = np.random.randint(0, 1000, size, dtype=np.int32)
+    if deterministic:
+        # Fixed patterns for exact validation checking
+        groups = (ids % 100) + 1
+        val1 = ids % 1000
+        val2 = 1000 - (ids % 1000)
+    else:
+        groups = np.random.randint(1, 100, size, dtype=np.int32) 
+        val1 = np.random.randint(0, 1000, size, dtype=np.int32)
+        val2 = np.random.randint(0, 1000, size, dtype=np.int32)
+        
     return pa.RecordBatch.from_arrays([
         pa.array(ids), 
         pa.array(groups), 
@@ -73,6 +80,66 @@ def measure_latency(cursor, query, iters):
         'p99': np.percentile(latencies, 99)
     }
 
+# ==========================================
+# VALIDATION SUITE
+# ==========================================
+def run_validation(cursor, client, options):
+    print("--- [ PRE-FLIGHT SYSTEM VALIDATION ] ---")
+    val_size = 10_000
+    
+    # 1. Seed deterministic data
+    execute_sync(cursor, f"DROP TABLE {TABLE_MATRIX}", ignore_errors=True)
+    execute_sync(cursor, f"CREATE TABLE {TABLE_MATRIX} (id INT, group_id INT, val1 INT, val2 INT)")
+    execute_sync(cursor, f"DROP TABLE {TABLE_DIM}", ignore_errors=True)
+    execute_sync(cursor, f"CREATE TABLE {TABLE_DIM} (group_id INT, multiplier INT)")
+
+    writer_dim, _ = client.do_put(flight.FlightDescriptor.for_path(TABLE_DIM), dim_schema, options=options)
+    writer_dim.write_batch(generate_dim_batch())
+    writer_dim.close()
+
+    writer_fact, _ = client.do_put(flight.FlightDescriptor.for_path(TABLE_MATRIX), fact_schema, options=options)
+    writer_fact.write_batch(generate_fact_batch(val_size, deterministic=True))
+    writer_fact.close()
+
+    def check(name, query, expected_substring):
+        rows = execute_sync(cursor, query)
+        output = rows[0][0] if rows and rows[0] else ""
+        if expected_substring in output:
+            print(f"  ✅ {name} Passed")
+        else:
+            print(f"  ❌ {name} Failed! Expected '{expected_substring}' but got:\n{output}")
+            raise SystemExit("Validation Failed. Aborting Benchmark.")
+
+    # 2. Test Clean State
+    print(" Validating Clean Memory State...")
+    # Point Lookup: ID 500 should have val1 = 500
+    check("Point Lookup (O(1))", f"SELECT val1 FROM {TABLE_MATRIX} WHERE id = 500", "500")
+    
+    # Aggregation: Count should be exactly 10,000
+    check("Aggregation (COUNT)", f"SELECT COUNT(*) FROM {TABLE_MATRIX}", "10000")
+    
+    # Range Scan: val1 > 500. In 0-999 repeating, 501-999 is 499 rows. Repeats 10 times = 4,990.
+    check("Range Scan", f"SELECT COUNT(*) FROM {TABLE_MATRIX} WHERE val1 > 500", "4990")
+    
+    # Hash Join: 10,000 facts matching 100 dims
+    check("Hash Join", f"SELECT * FROM {TABLE_MATRIX} JOIN {TABLE_DIM} ON {TABLE_MATRIX}.group_id = {TABLE_DIM}.group_id", "Total Matches Found: 10000")
+
+    # 3. Test Dirty State (Tombstones & RAM Deltas)
+    print(" Validating Dirty State (Tombstones & Deltas)...")
+    # Delete first 1,000 rows
+    execute_sync(cursor, f"DELETE FROM {TABLE_MATRIX} WHERE id < 1000")
+    # Update last 1,000 rows (Moves to RAM buffer)
+    execute_sync(cursor, f"UPDATE {TABLE_MATRIX} SET val1 = 8888 WHERE id >= 9000")
+
+    # Verify new count (10,000 - 1,000 = 9,000)
+    check("Tombstone Aggregation", f"SELECT COUNT(*) FROM {TABLE_MATRIX}", "9000")
+    
+    # Verify RAM updates were applied (exactly 1,000 rows should now be 8888)
+    check("RAM Delta Filtering", f"SELECT COUNT(*) FROM {TABLE_MATRIX} WHERE val1 = 8888", "1000")
+
+    print(" 🚀 All validation checks passed! Engine math is 100% correct.\n")
+
+
 def run_matrix():
     print("=====================================================")
     print(" 📈 AwanDB Dynamic Telemetry & Cache Boundary Matrix")
@@ -80,7 +147,12 @@ def run_matrix():
 
     conn = dbapi.connect(DB_URI, db_kwargs={"adbc.flight.sql.rpc.call_header.Authorization": BASIC_AUTH_HEADER})
     cursor = conn.cursor()
-    
+    client = flight.FlightClient(DB_URI)
+    options = flight.FlightCallOptions(headers=[(b"authorization", BASIC_AUTH_HEADER.encode("utf-8"))])
+
+    # --- NEW: Run the exact mathematical validation first ---
+    run_validation(cursor, client, options)
+
     # Expanded Metric Tracking
     metrics = {
         "Arrow DoPut Ingestion": [],
@@ -95,9 +167,6 @@ def run_matrix():
         "Dirty Aggregation (Full Scan)": [],
         "Dirty Hash Join (Fact x Dim)": []
     }
-
-    client = flight.FlightClient(DB_URI)
-    options = flight.FlightCallOptions(headers=[(b"authorization", BASIC_AUTH_HEADER.encode("utf-8"))])
 
     for size in DATA_SIZES:
         # Dynamic Iteration Scaling to save time on massive datasets
@@ -198,7 +267,6 @@ def run_matrix():
 
         metrics["Dirty Hash Join (Fact x Dim)"].append(
             measure_latency(cursor, f"SELECT * FROM {TABLE_MATRIX} JOIN {TABLE_DIM} ON {TABLE_MATRIX}.group_id = {TABLE_DIM}.group_id", iters))
-
 
     conn.close()
 

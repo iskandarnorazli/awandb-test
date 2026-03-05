@@ -72,7 +72,7 @@ Once the server is operational and listening on port 3000, open a new terminal a
 
 ```bash
 python telemetry_matrix.py
-
+python vectorAndGraph.py
 ```
 
 This script will scale datasets from 10K up to 31.25M rows across Clean and Dirty (tombstoned) states, calculate p50/p90/p99 percentiles, and output the dynamic Big-O execution equations for the native engine.
@@ -84,7 +84,7 @@ This script will scale datasets from 10K up to 31.25M rows across Clean and Dirt
 python benchmark.py
 python olapbenchmark.py
 python train_agent.py
-
+python benchmarkvalidation.py
 ```
 
 ## Available Tests

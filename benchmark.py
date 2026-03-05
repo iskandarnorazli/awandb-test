@@ -169,6 +169,24 @@ def run_benchmarks():
         latencies_read.append((time.perf_counter() - start) * 1000)
     record_metrics("Sequential SQL SELECTs", latencies_read, f"SELECT * FROM {TABLE_SEQ} WHERE id = <random_id>", results_table)
 
+    # NEW: UPDATE Benchmark
+    latencies_update = []
+    for _ in range(1000):
+        target_id = random.randint(0, 999)
+        new_val = random.randint(1, 100)
+        start = time.perf_counter()
+        execute_sync(cursor, f"UPDATE {TABLE_SEQ} SET val = {new_val} WHERE id = {target_id}")
+        latencies_update.append((time.perf_counter() - start) * 1000)
+    record_metrics("Point SQL UPDATEs (Random ID)", latencies_update, f"UPDATE {TABLE_SEQ} SET val = <random_val> WHERE id = <random_id>", results_table)
+
+    # NEW: DELETE Benchmark
+    latencies_delete = []
+    for i in range(1000):
+        start = time.perf_counter()
+        execute_sync(cursor, f"DELETE FROM {TABLE_SEQ} WHERE id = {i}")
+        latencies_delete.append((time.perf_counter() - start) * 1000)
+    record_metrics("Sequential SQL DELETEs", latencies_delete, f"DELETE FROM {TABLE_SEQ} WHERE id = <id>", results_table)
+
     benchmark_query(cursor, "Full-Table Aggregation (1M rows)", 
                     f"SELECT SUM(volume) FROM {TABLE_TICKS}", results_table, iterations=100)
 
@@ -244,7 +262,7 @@ def run_benchmarks():
     # Rows
     for r in results_table:
         print(f"| {r['name']:<38} | {r['iters']:<5} | {r['avg']:>8.2f} | {r['p50']:>8.2f} | {r['p90']:>8.2f} | {r['p99']:>8.2f} | {r['p99_9']:>9.2f} | {r['max']:>8.2f} |")
-        print(f"|   -> SQL: {r['sql']:<124} |")
+        print(f"|    -> SQL: {r['sql']:<124} |")
         print("-" * len(header))
         
     print("="*140 + "\n")
