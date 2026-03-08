@@ -73,12 +73,13 @@ Once the server is operational and listening on port 3000, open a new terminal a
 ```bash
 python telemetry_matrix.py
 python vectorAndGraph.py
+python compare_zerocopy.py
+python coreSQLtest.py
 ```
 
 This script will scale datasets from 10K up to 31.25M rows across Clean and Dirty (tombstoned) states, calculate p50/p90/p99 percentiles, and output the dynamic Big-O execution equations for the native engine.
 
 **Run Standard Benchmarks:**
-*(Requires the server to be running WITHOUT `--debug`)*
 
 ```bash
 python benchmark.py
@@ -93,4 +94,7 @@ python benchmarkvalidation.py
 * **`olapbenchmark.py`**: Heavy analytical workloads simulating 1GB+ OLAP queries.
 * **`benchmark.py`**: Mixed HTAP workloads (High-Frequency Trading ticks, active writes while querying).
 * **`train_agent.py`**: Specialized tests for AI Vector Search and Graph BFS capabilities.
-* **`benchmarkvalidate.py`**: Test to validate the result for LIMIT function to not skip or cheat by returning once found the limit result instead of resolving the full query, then, return with limited values/result.
+* **`benchmarkvalidate.py`**: Test to validate the result for LIMIT function to not skip or cheat by returning once found the 
+limit result instead of resolving the full query, then, return with limited values/result.
+* **`compare_zerocopy.py`**: Testing between normal query and zero-copy query for ingress and egress
+* **`coreSQLtest.py`**: Regression testing for core SQL methods, scalar and vector functions
